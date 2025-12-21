@@ -1,0 +1,220 @@
+---
+title: "Replication of Knaus 2024 Notebook"
+author: "Aaron Sennhenn"
+date: "2025-12-03"
+output: html_document
+---
+## Load packages and data
+
+First, load the relevant packages
+
+```{r, warning = F, message = F}
+if (!require("cobalt")) install.packages("cobalt", dependencies = TRUE); library(cobalt)
+if (!require("grf")) install.packages("grf", dependencies = TRUE); library(grf)
+if (!require("hdm")) install.packages("hdm", dependencies = TRUE); library(hdm)
+if (!require("gridExtra")) install.packages("gridExtra", dependencies = TRUE); library(gridExtra)
+if (!require("tidyverse")) install.packages("tidyverse", dependencies = TRUE); library(tidyverse)
+if (!require("AER")) install.packages("AER", dependencies = TRUE); library(AER)
+source("C:/Users/aaron/OneDrive/Desktop/Data Science Studium/Master Thesis/R/Ridge NNet/nn_functions.R")
+```
+
+Neural Net functions..
+
+```{r}
+source("C:/Users/aaron/OneDrive/Desktop/Data Science Studium/Master Thesis/R/Ridge NNet/nn_functions.R")
+```
+
+
+
+and the data
+
+```{r}
+data(pension) # Find variable description if you type ?pension in console
+# Treatment
+D = pension$p401
+# Instrument
+Z = pension$e401
+# Outcome
+Y = pension$net_tfa
+# Controls
+X = model.matrix(~ 0 + age + db + educ + fsize + hown + inc + male + marr + pira + twoearn, data = pension)
+colnames(X) = c("Age","Benefit pension","Education","Family size","Home owner","Income","Male","Married","IRA","Two earners")
+```
+
+Define useful quantities and set the seed:
+
+```{r}
+# Helpful variables
+N = length(Y)
+ones = matrix(1,N,1)
+
+# Choose unit for which causal/instrumental forest weights should be calculated
+unit = 1
+
+# Define number of folds for cross-fitting
+nfolds = 2
+
+set.seed(1234)
+```
+
+## One function to calculate them all
+
+Proposition 1 in the paper shows that the outcome weights vector can be obtained in the general form
+$$\boldsymbol{\omega'} = (\boldsymbol{\tilde{Z}'\tilde{D}})^{-1} \boldsymbol{\tilde{Z}'T}$$
+
+where $\boldsymbol{\tilde{Z}}$, $\boldsymbol{\tilde{D}}$ and $\boldsymbol{T}$ are pseudo-instrument, pseudo-treatment and the transformation matrix, respectively. 
+
+This motivates the definition of the `weight_maker(Dtilde,Ztilde,T_mat)` function taking the three generic inputs and producing the outcome weights vector:
+
+```{r}
+weight_maker = function(Dtilde,Ztilde,T_mat) {
+  omega = (t(Ztilde) %*% Dtilde)^(-1) %*% t(Ztilde) %*% T_mat
+  return(omega)
+}
+```
+
+In the following, we just need to define the three components for the respective estimators and plug them into this generic function to obtain the outcome weights.
+
+
+## Estimate all nuisance parameters and get outcome smoother matrices
+
+Equation (8) in the paper shows which nuisance parameters are required for the estimators under consideration. Here, we estimate them all using honest random forest and 2-fold cross-fitting. Additionally, we extract the relevant smoother matrices $\boldsymbol{S}$, $\boldsymbol{S^d_0}$, $\boldsymbol{S^d_1}$, $\boldsymbol{S^z_0}$, and $\boldsymbol{S^z_1}$.
+
+```{r}
+# Get fold number
+fold = sample(1:nfolds,N,replace=T)
+
+#Hyperparameters
+nn_hyps <- list(size=5, maxit=500, decay=0.01, linout=TRUE)
+
+# Initialize nuisance parameters
+Yhat = Yhatd0 = Yhatd1 = Yhatz0 = Yhatz1 = 
+  Dhat = Dhatz0 = Dhatz1 = Zhat = rep(NA,N)
+
+# Initialize smoother matrices
+S = Sd0 = Sd1 = Sz0 = Sz1 = matrix(0,N,N)
+
+for (i in 1:nfolds){
+  #Calculate nuissance parameters and smoother matrices
+  nn_Yhat = fit_RidgeNN(X[fold != i,], Y[fold != i], nn_hyps)
+  Yhat[fold == i] = predict_RidgeNN(nn_Yhat, X[fold == i,])$predictions
+  S[fold == i, fold != i] = as.matrix(get_nn_weights(nn_Yhat, X[fold == i,]))
+
+  nn_Yhatd0 = fit_RidgeNN(X[fold != i & D==0,], Y[fold != i & D==0], nn_hyps)
+  Yhatd0[fold == i] = predict_RidgeNN(nn_Yhatd0, X[fold == i,])$predictions
+  Sd0[fold == i, fold != i & D==0] = as.matrix(get_nn_weights(nn_Yhatd0, X[fold == i,]))
+
+  nn_Yhatd1 = fit_RidgeNN(X[fold != i & D==1,], Y[fold != i & D==1], nn_hyps)
+  Yhatd1[fold == i] = predict_RidgeNN(nn_Yhatd1, X[fold == i,])$predictions
+  Sd1[fold == i, fold != i & D==1] = as.matrix(get_nn_weights(nn_Yhatd1, X[fold == i,]))
+
+  nn_Yhatz0 = fit_RidgeNN(X[fold != i & Z==0,], Y[fold != i & Z==0], nn_hyps)
+  Yhatz0[fold == i] = predict_RidgeNN(nn_Yhatz0, X[fold == i,])$predictions
+  Sz0[fold == i, fold != i & Z==0] = as.matrix(get_nn_weights(nn_Yhatz0, X[fold == i,]))
+
+  nn_Yhatz1 = fit_RidgeNN(X[fold != i & Z==1,], Y[fold != i & Z==1], nn_hyps)
+  Yhatz1[fold == i] = predict_RidgeNN(nn_Yhatz1, X[fold == i,])$predictions
+  Sz1[fold == i, fold != i & Z==1] = as.matrix(get_nn_weights(nn_Yhatz1, X[fold == i,]))
+
+  nn_Dhat = fit_RidgeNN(X[fold != i,], D[fold != i], nn_hyps)
+  Dhat[fold == i] = predict_RidgeNN(nn_Dhat, X[fold == i,])$predictions
+
+  nn_Dhatz0 = fit_RidgeNN(X[fold != i & Z==0,], D[fold != i & Z==0], nn_hyps)
+  Dhatz0[fold == i] = predict_RidgeNN(nn_Dhatz0, X[fold == i,])$predictions
+
+  nn_Dhatz1 = fit_RidgeNN(X[fold != i & Z==1,], D[fold != i & Z==1], nn_hyps)
+  Dhatz1[fold == i] = predict_RidgeNN(nn_Dhatz1, X[fold == i,])$predictions
+
+  nn_Zhat = fit_RidgeNN(X[fold != i,], Z[fold != i], nn_hyps)
+  Zhat[fold == i] = predict_RidgeNN(nn_Zhat, X[fold == i,])$predictions
+}
+
+```
+
+
+For those not familiar with smoothers, let's observe that they produce exactly the same predictions as the original `predict()` functions:
+```{r}
+cat("Smoother matrices replicate predicted nuisance parameter?",
+ all(
+  all.equal(as.numeric(S %*% Y), Yhat) == TRUE,
+  all.equal(as.numeric(Sd0 %*% Y), Yhatd0) == TRUE,
+  all.equal(as.numeric(Sd1 %*% Y), Yhatd1) == TRUE,
+  all.equal(as.numeric(Sz0 %*% Y), Yhatz0) == TRUE,
+  all.equal(as.numeric(Sz1 %*% Y), Yhatz1) == TRUE)
+)
+```
+
+Note that the the neural net smoother matices are not affine:
+```{r}
+cat("Affine smoother matrices?",
+all(
+  all.equal(as.numeric(ones),as.numeric(rowSums(S))) == TRUE,
+  all.equal(as.numeric(ones),as.numeric(rowSums(Sd0))) == TRUE,
+  all.equal(as.numeric(ones),as.numeric(rowSums(Sd1))) == TRUE,
+  all.equal(as.numeric(ones),as.numeric(rowSums(Sz0))) == TRUE,
+  all.equal(as.numeric(ones),as.numeric(rowSums(Sz1))) == TRUE)
+)
+```
+
+Finally, define the different IPW weights for later use:
+```{r}
+lambda1 = D / Dhat
+lambda0 = (1-D) / (1-Dhat)
+lambdaz1 = Z / Zhat
+lambdaz0 = (1-Z) / (1-Zhat)
+```
+
+# Outcome weights of DML and GRF
+
+
+Declare Nuissance Parameters:
+
+```{r}
+Uhat = Y - Yhat
+Vhat = D - Dhat
+Rhat = Z - Zhat
+T_nn = diag(N) - S
+```
+
+```{r}
+Uhat = Y - Yhat
+Dtilde_nn = Vhat
+Rhat = Z - Zhat
+T_nn = diag(N) - S
+```
+
+## Partially linear IV regression
+
+To obtain the standard partially linear IV regression, we first solve the canonical moment condition to see which value should be replicated:
+```{r}
+to_be_rep_plriv = mean(Rhat * Uhat) / mean(Rhat * Vhat)
+to_be_rep_plriv
+```
+
+Compared to IF, we only need to pass a different pseudo-instrument to the `weight_maker` to replicate this number:
+```{r}
+# Modified pseudo-instrument
+Ztilde_plriv = Rhat * ones
+# Get outcome weights
+omega_plriv = weight_maker(Dtilde_nn, Ztilde_plriv, T_nn) 
+cat("ω'Y replicates moment based implentation?",all.equal(as.numeric( omega_plriv %*% Y ), to_be_rep_plriv))
+```
+
+
+# NOTEBOOK 2: 
+```{r, warning = F, message = F}
+if (!require("OutcomeWeights")) install.packages("OutcomeWeights", dependencies = TRUE); library(OutcomeWeights)
+if (!require("hdm")) install.packages("hdm", dependencies = TRUE); library(hdm)
+if (!require("grf")) install.packages("grf", dependencies = TRUE); library(grf)
+if (!require("cobalt")) install.packages("cobalt", dependencies = TRUE); library(cobalt)
+if (!require("tidyverse")) install.packages("tidyverse", dependencies = TRUE); library(tidyverse)
+if (!require("viridis")) install.packages("viridis", dependencies = TRUE); library(viridis)
+if (!require("gridExtra")) install.packages("gridExtra", dependencies = TRUE); library(gridExtra)
+```
+
+set.seed(1234)
+
+
+
+
+
