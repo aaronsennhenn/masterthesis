@@ -6,6 +6,31 @@
 
 
 #------------------------TORCH FUNCTIONS---------------------------------------#
+fit_torchNN <- function(X, Y, compute.oob.predictions){
+  
+  n_features = ncol(X)
+  nn_hyps = list(
+    lr         = 0.05,   
+    epochs     = 100,     
+    batch_size = 128,      
+    patience   = 15,      
+    tol        = 1e-4,    
+    show_train = FALSE,    
+    loss_type  = "mse",    
+    scale_loss = TRUE)
+  hidden = c(15, 10)
+  
+  
+  model <- BuildNN(n_features, hidden)
+  model_trained <- TrainNN(model, X, Y, nn_hyps)
+  
+  return(model_trained)
+  
+}
+
+
+
+
 BuildNN <- function(n_features, hidden) {
   
   net <- nn_module(
@@ -45,9 +70,8 @@ BuildNN <- function(n_features, hidden) {
 }
 
 
-TrainNN <- function(model, X, Y, nn_hyps, seed) {
-  
-  set.seed(seed)
+
+TrainNN <- function(model, X, Y, nn_hyps) {
   
   lr       <- nn_hyps$lr
   epochs   <- nn_hyps$epochs
@@ -58,51 +82,100 @@ TrainNN <- function(model, X, Y, nn_hyps, seed) {
   loss_type <- nn_hyps$loss_type
   scale_loss <- nn_hyps$scale_loss
   
-  #Scale
-  n <- nrow(X)
+  # ======================
+  # Scale
+  # ======================
   X <- as.matrix(X)
   Y <- as.numeric(Y)
+  
+  if (anyNA(X)) stop("X contains NA")
+  if (anyNA(Y)) stop("Y contains NA")
+  
   scale_info <- scale_train_data(X, Y)
   model$scale_info <- scale_info
+  
   X <- scale_info$X_scaled
   sigma_y <- scale_info$sigma_y
   
-  #Tensors
-  X_t <- torch_tensor(as.matrix(X), dtype = torch_float())
-  Y_t <- torch_tensor(as.matrix(Y), dtype = torch_float())
+  if ((is.na(sigma_y) || sigma_y == 0) && scale_loss) {
+    scale_loss <- FALSE
+  }
+  
+  # ======================
+  # Tensors
+  # ======================
+  X_t <- torch_tensor(X, dtype = torch_float())
+  Y_t <- torch_tensor(matrix(Y, ncol = 1), dtype = torch_float())
   
   dataset <- tensor_dataset(X_t, Y_t)
   loader  <- dataloader(dataset, batch_size = batch_sz, shuffle = TRUE)
+  
+  if (length(loader) == 0) {
+    stop("DataLoader has zero batches. batch_size too large?")
+  }
   
   optimizer <- optim_adam(model$parameters, lr = lr)
   
   best <- Inf
   wait <- 0
+  best_state <- model$state_dict()  
   
+  # ======================
+  # Training loop
+  # ======================
   for (epoch in 1:epochs) {
+    
     total_loss <- 0
+    n_batches <- 0
     
     coro::loop(for (batch in loader) {
+      
       optimizer$zero_grad()
       preds <- model(batch[[1]])
+      
+      if (any(!is.finite(as.numeric(preds)))) {
+        stop(sprintf("Non-finite predictions at epoch %d", epoch))
+      }
+      
       if (loss_type == "mse") {
-        if (scale_loss == TRUE) {
-        loss <- torch_mean(torch_pow((preds - batch[[2]]) / sigma_y, 2)) # LOSS IS SCLAED BY Y STD FOR NUMERICAL STABILITY
-        } else {loss <- nnf_mse_loss(preds, batch[[2]])}
+        if (scale_loss) {
+          loss <- torch_mean(torch_pow((preds - batch[[2]]) / sigma_y, 2))
+        } else {
+          loss <- nnf_mse_loss(preds, batch[[2]])
+        }
       } else if (loss_type == "mae") {
         loss <- nnf_l1_loss(preds, batch[[2]])
       } else {
         stop("Unsupported loss type")
       }
+      
+      if (!is.finite(loss$item())) {
+        stop(sprintf("Loss is NA/NaN/Inf at epoch %d", epoch))
+      }
+      
       loss$backward()
       optimizer$step()
+      
       total_loss <- total_loss + loss$item()
+      n_batches <- n_batches + 1
     })
     
-    avg <- total_loss / length(loader)
-    if (show) cat(sprintf("Epoch %d/%d - Loss %.5f\n", epoch, epochs, avg))
+    avg <- total_loss / n_batches
     
+    if (!is.finite(avg)) {
+      stop(sprintf(
+        "avg loss invalid at epoch %d (total_loss=%f, n_batches=%d)",
+        epoch, total_loss, n_batches
+      ))
+    }
+    
+    if (show) {
+      cat(sprintf("Epoch %d/%d - Loss %.6f\n", epoch, epochs, avg))
+    }
+    
+    # ======================
     # Early stopping
+    # ======================
     if (avg < best - tol) {
       best <- avg
       wait <- 0
@@ -118,18 +191,32 @@ TrainNN <- function(model, X, Y, nn_hyps, seed) {
   }
   
   model$load_state_dict(best_state)
-  
   return(model)
 }
 
 
-PredictNN <- function(model, X_new) {
-  model$eval()
-  X_new <- scale_test_data(X_new, model$scale_info)
-  X_t <- torch_tensor(as.matrix(X_new), dtype = torch_float())
-  predictions <- as.numeric(model(X_t))
-  return(predictions)
+Predict_torchNN <- function(model, X_new, lambda = 0.1, pred_type = "normal") {
+    
+   #Predicting with dual solution
+   W <- get_torch_nn_weights(model, X_new, lambda)
+   Y_train <- model$scale_info$Y_train
+   pred_dual <- as.numeric(W %*% Y_train)
+    
+   #Predicting with forward pass (doesn't produce valid smoother)
+   model$eval()
+   X_new <- scale_test_data(X_new, model$scale_info)
+   X_t <- torch_tensor(as.matrix(X_new), dtype = torch_float())
+   pred_normal <- as.numeric(model(X_t))
+   
+   if (pred_type == "normal"){
+      output <- list(predictions = pred_normal, alt_prediction = pred_dual)
+   } else { 
+      output <- list(predictions = pred_dual, alt_prediction = pred_normal)
+   }
+   
+  return(output)
 }
+
 
 
 ExtractLastHiddenLayer <- function(model, X_new) {
@@ -138,6 +225,38 @@ ExtractLastHiddenLayer <- function(model, X_new) {
   out <- model(X_t, return_last_hidden = TRUE)
   as.matrix(as_array(out$last_hidden))
 }
+
+
+compute_omega <- function(PHI_Xj, PHI_X) {
+  
+  #Make sure embeddings are matrices
+  PHI_X <- as.matrix(PHI_X)
+  PHI_Xj <- as.matrix(PHI_Xj)
+  
+  ridge_inv <- solve(t(PHI_X) %*% PHI_X + lambda * diag(ncol(PHI_X)))
+  W <- PHI_Xj %*% ridge_inv %*% t(PHI_X)
+  
+  return(W)  
+}
+
+
+get_torch_nn_weights <- function(model, X_new, lambda = 0.1){
+  
+  #Scale test data
+  X_new <- as.matrix(X_new)
+  X_new <- scale_test_data(X_new, model$scale_info)
+  
+  X_train <- model$scale_info$X_scaled
+  
+  #Get embeddings and lambda to compute contributions
+  test_embeddings <- ExtractLastHiddenLayer(model, X_new)
+  train_embeddings <- ExtractLastHiddenLayer(model, X_train)
+  
+  W <- compute_omega(test_embeddings, train_embeddings, lambda)
+  
+  return(W)
+}
+
 #------------------------------------------------------------------------------#
 
 
@@ -510,7 +629,7 @@ scale_train_data <- function(X, Y) {
   mu_y <- mean(Y)
   Y_scaled <- (Y-mu_y)/sigma_y
   
-  return(list(X_scaled = X_scaled, Y_scaled = Y_scaled, sigma_y = sigma_y, mu_y = mu_y, sigma_x = sigma_x, mu_x = mu_x))
+  return(list(X_train = X, Y_train = Y, X_scaled = X_scaled, Y_scaled = Y_scaled, sigma_y = sigma_y, mu_y = mu_y, sigma_x = sigma_x, mu_x = mu_x))
   }
 
 
